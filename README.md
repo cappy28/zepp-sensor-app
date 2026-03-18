@@ -1,1 +1,0 @@
-# zepp-sensor-app
