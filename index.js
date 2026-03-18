@@ -1,192 +1,354 @@
-// app-side/index.js
-// Service compagnon — tourne sur le TÉLÉPHONE dans le contexte de l'app Zepp
-// Reçoit les données de la montre et les expose à ton application principale
+// page/index.js
+// Interface principale affichée sur la montre Amazfit Bip 6
+// Collecte les données capteurs et les envoie vers le téléphone
 
+import { createWidget, widget, align, prop, text_style } from '@zos/ui';
+import { HeartRate } from '@zos/sensor';
+import { Pedometer } from '@zos/sensor';
 import { messageBuilder } from '@zos/router';
+import { timer } from '@zos/timer';
+import { px } from '@zos/utils';
 
 // ─────────────────────────────────────────────────────────────
-// STOCKAGE DES DONNÉES
+// CONSTANTES
 // ─────────────────────────────────────────────────────────────
 
-// Dernière mesure reçue
-let latestData = null;
+// Résolution écran Bip 6
+const SCREEN_W = 194;
+const SCREEN_H = 368;
 
-// Historique circulaire des N dernières mesures
-const MAX_HISTORY = 100;
-const dataHistory = [];
-
-// Callbacks abonnés (ton app principale peut s'abonner ici)
-const subscribers = [];
+// Intervalle d'envoi des données vers le téléphone (en ms)
+// 5000 = toutes les 5 secondes (bon équilibre batterie / fraîcheur)
+const SEND_INTERVAL_MS = 5000;
 
 // ─────────────────────────────────────────────────────────────
-// CYCLE DE VIE DU SERVICE
+// ÉTAT GLOBAL DE LA PAGE
 // ─────────────────────────────────────────────────────────────
 
-AppSideService({
+// Widgets UI (références pour mise à jour)
+let wStatus = null;
+let wHeartValue = null;
+let wStepsValue = null;
+let wLastSent = null;
+
+// Instances des capteurs
+let heartRateSensor = null;
+let pedometerSensor = null;
+
+// Données collectées en temps réel
+let currentData = {
+  heartRate: 0,
+  steps: 0,
+  timestamp: 0
+};
+
+// Timer d'envoi périodique
+let sendTimer = null;
+
+// Compteur d'envois réussis (pour debug)
+let sendCount = 0;
+
+// ─────────────────────────────────────────────────────────────
+// CYCLE DE VIE DE LA PAGE
+// ─────────────────────────────────────────────────────────────
+
+Page({
   onInit() {
-    console.log('[AppSide] Service compagnon démarré');
-    setupMessageListener();
+    console.log('[SensorBridge] Page initialisée');
+    buildUI();
+    initSensors();
+    startSending();
   },
 
   onDestroy() {
-    console.log('[AppSide] Service compagnon arrêté');
-    subscribers.length = 0;
+    console.log('[SensorBridge] Page détruite — nettoyage');
+    stopSending();
+    stopSensors();
   }
 });
 
 // ─────────────────────────────────────────────────────────────
-// ÉCOUTE DES MESSAGES DE LA MONTRE
+// CONSTRUCTION DE L'INTERFACE
 // ─────────────────────────────────────────────────────────────
 
-function setupMessageListener() {
-  // Déclenché à chaque message envoyé par messageBuilder.request() côté montre
-  messageBuilder.on('request', (ctx) => {
-    const data = ctx.request.payload;
-
-    console.log('[AppSide] Données reçues :', JSON.stringify(data));
-
-    // Valider les données reçues
-    if (!isValidData(data)) {
-      console.log('[AppSide] Données invalides ignorées');
-      ctx.response({ result: 'error', reason: 'invalid_data' });
-      return;
-    }
-
-    // 1. Stocker les données
-    storeData(data);
-
-    // 2. Notifier tous les abonnés (ton app principale)
-    notifySubscribers(data);
-
-    // 3. Optionnel : transmettre vers un serveur externe
-    // forwardToServer(data);
-
-    // 4. Confirmer la réception à la montre
-    // Cela déclenchera le .then() dans messageBuilder.request() côté montre
-    ctx.response({
-      result: 'ok',
-      receivedAt: Date.now(),
-      count: dataHistory.length
-    });
+function buildUI() {
+  // ── Titre ──
+  createWidget(widget.TEXT, {
+    x: 0,
+    y: 20,
+    w: SCREEN_W,
+    h: 35,
+    text: 'SENSOR BRIDGE',
+    text_size: 16,
+    color: 0xFFFFFF,
+    align_h: align.CENTER_H,
+    text_style: text_style.NONE
   });
 
-  console.log('[AppSide] Listener message bridge actif');
+  // ── Statut de connexion ──
+  wStatus = createWidget(widget.TEXT, {
+    x: 0,
+    y: 58,
+    w: SCREEN_W,
+    h: 26,
+    text: '● EN ATTENTE',
+    text_size: 12,
+    color: 0xFFAA00,   // Orange = en attente
+    align_h: align.CENTER_H
+  });
+
+  // ── Séparateur ──
+  createWidget(widget.FILL_RECT, {
+    x: 30,
+    y: 90,
+    w: SCREEN_W - 60,
+    h: 1,
+    color: 0x333333
+  });
+
+  // ── Label fréquence cardiaque ──
+  createWidget(widget.TEXT, {
+    x: 0,
+    y: 102,
+    w: SCREEN_W,
+    h: 20,
+    text: 'FREQUENCE CARDIAQUE',
+    text_size: 10,
+    color: 0x888888,
+    align_h: align.CENTER_H
+  });
+
+  // ── Valeur BPM ──
+  wHeartValue = createWidget(widget.TEXT, {
+    x: 0,
+    y: 124,
+    w: SCREEN_W,
+    h: 52,
+    text: '--',
+    text_size: 44,
+    color: 0xFF3355,   // Rouge cardiaque
+    align_h: align.CENTER_H
+  });
+
+  createWidget(widget.TEXT, {
+    x: 0,
+    y: 178,
+    w: SCREEN_W,
+    h: 18,
+    text: 'bpm',
+    text_size: 13,
+    color: 0xFF3355,
+    align_h: align.CENTER_H
+  });
+
+  // ── Séparateur ──
+  createWidget(widget.FILL_RECT, {
+    x: 30,
+    y: 204,
+    w: SCREEN_W - 60,
+    h: 1,
+    color: 0x333333
+  });
+
+  // ── Label pas ──
+  createWidget(widget.TEXT, {
+    x: 0,
+    y: 214,
+    w: SCREEN_W,
+    h: 20,
+    text: 'PAS DU JOUR',
+    text_size: 10,
+    color: 0x888888,
+    align_h: align.CENTER_H
+  });
+
+  // ── Valeur pas ──
+  wStepsValue = createWidget(widget.TEXT, {
+    x: 0,
+    y: 236,
+    w: SCREEN_W,
+    h: 42,
+    text: '0',
+    text_size: 36,
+    color: 0x44AAFF,   // Bleu
+    align_h: align.CENTER_H
+  });
+
+  createWidget(widget.TEXT, {
+    x: 0,
+    y: 280,
+    w: SCREEN_W,
+    h: 18,
+    text: 'pas',
+    text_size: 13,
+    color: 0x44AAFF,
+    align_h: align.CENTER_H
+  });
+
+  // ── Séparateur ──
+  createWidget(widget.FILL_RECT, {
+    x: 30,
+    y: 305,
+    w: SCREEN_W - 60,
+    h: 1,
+    color: 0x333333
+  });
+
+  // ── Dernier envoi ──
+  wLastSent = createWidget(widget.TEXT, {
+    x: 0,
+    y: 314,
+    w: SCREEN_W,
+    h: 40,
+    text: `Envoi toutes les ${SEND_INTERVAL_MS / 1000}s`,
+    text_size: 11,
+    color: 0x555555,
+    align_h: align.CENTER_H
+  });
 }
 
 // ─────────────────────────────────────────────────────────────
-// VALIDATION
+// GESTION DES CAPTEURS
 // ─────────────────────────────────────────────────────────────
 
-function isValidData(data) {
-  return (
-    data !== null &&
-    typeof data === 'object' &&
-    typeof data.heartRate === 'number' &&
-    typeof data.steps === 'number' &&
-    typeof data.timestamp === 'number' &&
-    data.timestamp > 0
-  );
+function initSensors() {
+  // ── Capteur fréquence cardiaque ──
+  try {
+    heartRateSensor = new HeartRate();
+
+    // Démarrer la mesure en continu
+    heartRateSensor.start();
+
+    // Callback déclenché à chaque nouvelle valeur
+    heartRateSensor.onCurrentChange(() => {
+      const bpm = heartRateSensor.getCurrent();
+
+      // Ignorer les valeurs nulles ou aberrantes (montre pas portée)
+      if (bpm > 0 && bpm < 250) {
+        currentData.heartRate = bpm;
+
+        // Mettre à jour l'affichage immédiatement
+        if (wHeartValue) {
+          wHeartValue.setProperty(prop.TEXT, String(bpm));
+        }
+        console.log(`[Capteur] Fréquence cardiaque : ${bpm} bpm`);
+      }
+    });
+
+    console.log('[Capteur] HeartRate initialisé');
+  } catch (e) {
+    console.log('[Capteur] Erreur HeartRate:', e.message);
+  }
+
+  // ── Capteur podomètre ──
+  try {
+    pedometerSensor = new Pedometer();
+
+    pedometerSensor.onStepChange(() => {
+      const steps = pedometerSensor.getSteps();
+      currentData.steps = steps;
+
+      if (wStepsValue) {
+        wStepsValue.setProperty(prop.TEXT, String(steps));
+      }
+      console.log(`[Capteur] Pas : ${steps}`);
+    });
+
+    console.log('[Capteur] Pedometer initialisé');
+  } catch (e) {
+    console.log('[Capteur] Erreur Pedometer:', e.message);
+  }
 }
 
-// ─────────────────────────────────────────────────────────────
-// STOCKAGE
-// ─────────────────────────────────────────────────────────────
-
-function storeData(data) {
-  latestData = data;
-
-  // Ajouter à l'historique
-  dataHistory.push(data);
-
-  // Limiter la taille de l'historique
-  if (dataHistory.length > MAX_HISTORY) {
-    dataHistory.shift();
+function stopSensors() {
+  try {
+    if (heartRateSensor) {
+      heartRateSensor.stop();
+      heartRateSensor = null;
+    }
+  } catch (e) {
+    console.log('[Capteur] Erreur arrêt HeartRate:', e.message);
   }
 }
 
 // ─────────────────────────────────────────────────────────────
-// SYSTÈME D'ABONNEMENT (Pub/Sub)
+// ENVOI DES DONNÉES VERS LE TÉLÉPHONE
 // ─────────────────────────────────────────────────────────────
 
-function notifySubscribers(data) {
-  subscribers.forEach((callback) => {
-    try {
-      callback(data);
-    } catch (err) {
-      console.log('[AppSide] Erreur dans subscriber :', err);
-    }
-  });
-}
+function sendData() {
+  // Timestamp au moment de l'envoi
+  currentData.timestamp = Date.now();
 
-// ─────────────────────────────────────────────────────────────
-// API PUBLIQUE — utilisable depuis ton app principale
-// ─────────────────────────────────────────────────────────────
-
-/**
- * S'abonner aux nouvelles données capteurs.
- * Retourne une fonction pour se désabonner.
- *
- * Exemple d'utilisation dans ton app :
- *   const unsubscribe = onSensorData((data) => {
- *     console.log('Nouveau BPM :', data.heartRate);
- *   });
- *   // Plus tard :
- *   unsubscribe();
- */
-export function onSensorData(callback) {
-  subscribers.push(callback);
-
-  return function unsubscribe() {
-    const idx = subscribers.indexOf(callback);
-    if (idx !== -1) {
-      subscribers.splice(idx, 1);
-    }
+  // Payload JSON à envoyer
+  const payload = {
+    heartRate: currentData.heartRate,
+    steps: currentData.steps,
+    timestamp: currentData.timestamp
   };
+
+  console.log('[Bridge] Envoi :', JSON.stringify(payload));
+
+  // Envoi via le message bridge officiel Zepp OS
+  // messageBuilder.request() envoie vers app-side/index.js sur le téléphone
+  messageBuilder
+    .request(payload, { timeout: 3000 })
+    .then((response) => {
+      // Le téléphone a confirmé la réception
+      sendCount++;
+      console.log(`[Bridge] Envoi #${sendCount} confirmé :`, JSON.stringify(response));
+
+      // Mettre le statut en vert
+      if (wStatus) {
+        wStatus.setProperty(prop.TEXT, '● ACTIF');
+        wStatus.setProperty(prop.COLOR, 0x00FF88);
+      }
+
+      // Afficher l'heure du dernier envoi réussi
+      if (wLastSent) {
+        const d = new Date(currentData.timestamp);
+        const timeStr = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+        wLastSent.setProperty(prop.TEXT, `Dernier envoi : ${timeStr}`);
+        wLastSent.setProperty(prop.COLOR, 0x008844);
+      }
+    })
+    .catch((err) => {
+      // Erreur BLE ou timeout — le téléphone est peut-être hors portée
+      console.log('[Bridge] Erreur envoi :', err);
+
+      if (wStatus) {
+        wStatus.setProperty(prop.TEXT, '⚠ HORS PORTEE');
+        wStatus.setProperty(prop.COLOR, 0xFF8800);
+      }
+    });
 }
 
-/**
- * Récupérer la dernière mesure reçue.
- * Retourne null si aucune donnée n'a encore été reçue.
- */
-export function getLatestData() {
-  return latestData;
+function startSending() {
+  // Premier envoi immédiat
+  sendData();
+
+  // Envois périodiques
+  sendTimer = timer.createTimer(
+    SEND_INTERVAL_MS,      // Délai avant premier tick
+    SEND_INTERVAL_MS,      // Intervalle entre les ticks
+    sendData               // Fonction appelée à chaque tick
+  );
+
+  console.log(`[Bridge] Timer démarré (intervalle : ${SEND_INTERVAL_MS}ms)`);
 }
 
-/**
- * Récupérer l'historique des mesures (max MAX_HISTORY entrées).
- * Retourne une copie du tableau (pas de référence directe).
- */
-export function getHistory() {
-  return [...dataHistory];
-}
-
-/**
- * Vider l'historique.
- */
-export function clearHistory() {
-  dataHistory.length = 0;
-  latestData = null;
-  console.log('[AppSide] Historique vidé');
+function stopSending() {
+  if (sendTimer) {
+    timer.stopTimer(sendTimer);
+    sendTimer = null;
+    console.log('[Bridge] Timer arrêté');
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
-// OPTIONNEL : Transmission vers serveur externe
+// UTILITAIRES
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Décommente et configure si tu veux envoyer les données
- * vers ton propre backend (API REST, WebSocket, etc.)
- */
-// async function forwardToServer(data) {
-//   try {
-//     const response = await fetch('https://ton-api.com/sensor', {
-//       method: 'POST',
-//       headers: { 'Content-Type': 'application/json' },
-//       body: JSON.stringify(data)
-//     });
-//     const result = await response.json();
-//     console.log('[AppSide] Serveur :', result);
-//   } catch (err) {
-//     console.log('[AppSide] Erreur serveur :', err);
-//   }
-// }
+// Padding zéro pour l'affichage de l'heure (ex: 9 → "09")
+function pad(n) {
+  return n < 10 ? '0' + n : String(n);
+}
