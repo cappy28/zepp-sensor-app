@@ -1,0 +1,38 @@
+{
+  "app": {
+    "appId": 1000001,
+    "appName": "SensorBridge",
+    "appType": "app",
+    "version": {
+      "code": 1,
+      "name": "1.0.0"
+    },
+    "icon": "assets/raw/watchface/icon.png",
+    "vender": "SensorBridge",
+    "description": "Real-time heart rate and step sensor bridge to mobile app"
+  },
+  "permissions": [
+    "device:os.heart_rate",
+    "device:os.step_counter",
+    "device:os.motion"
+  ],
+  "targets": {
+    "Bip6": {
+      "module": {
+        "page": {
+          "pages": ["page/index"]
+        },
+        "app-side": {
+          "path": "app-side/index"
+        }
+      },
+      "platforms": [
+        {
+          "name": "Bip6",
+          "deviceSource": 229
+        }
+      ],
+      "designWidth": 194
+    }
+  }
+}
